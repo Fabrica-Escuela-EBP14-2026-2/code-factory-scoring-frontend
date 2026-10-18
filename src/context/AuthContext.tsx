@@ -19,6 +19,7 @@ type AuthSession = {
   token: string
   tokenType: string
   expiresIn: number
+  expiresAt?: number
   mode: "api" | "mock"
   user: AuthUser
 }
@@ -63,6 +64,14 @@ function readStoredSession(): AuthSession | null {
       !isUserRole(session.user.role) ||
       (session.mode !== "api" && session.mode !== "mock")
     ) {
+      localStorage.removeItem(STORAGE_KEY)
+      return null
+    }
+    if (
+      session.mode === "api" &&
+      (typeof session.expiresAt !== "number" || Date.now() > session.expiresAt)
+    ) {
+      console.warn("Sesión expirada")
       localStorage.removeItem(STORAGE_KEY)
       return null
     }
@@ -141,6 +150,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       token: result.token,
       tokenType: result.tipoToken || "Bearer",
       expiresIn: result.expiraEn,
+      expiresAt: Date.now() + result.expiraEn,
       mode: "api",
       user: { email: result.email, role: result.rol },
     }
