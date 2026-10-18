@@ -102,12 +102,14 @@ export default function Login() {
           </button>
         </form>
 
-        <aside className="mt-8 border-t border-slate-200 pt-5 text-xs leading-5 text-slate-600">
-          <p className="font-semibold text-slate-800">Cuentas de simulación local</p>
-          <p>Administrador: admin@score.local / Admin123*</p>
-          <p>Analista: analista@score.local / Analista123*</p>
-          <p className="mt-1 text-slate-500">No requieren conexión con el backend.</p>
-        </aside>
+        {import.meta.env.VITE_AUTH_MODE === "mock" && (
+          <aside className="mt-8 border-t border-slate-200 pt-5 text-xs leading-5 text-slate-600">
+            <p className="font-semibold text-slate-800">Cuentas de simulación local</p>
+            <p>Administrador: admin@score.local / Admin123*</p>
+            <p>Analista: analista@score.local / Analista123*</p>
+            <p className="mt-1 text-slate-500">No requieren conexión con el backend.</p>
+          </aside>
+        )}
       </section>
     </main>
   )

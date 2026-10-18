@@ -61,6 +61,11 @@ vite.config.ts  Configuración de Vite, React y Tailwind
 La URL base del backend se configura mediante `VITE_API_URL`. Consulte
 `.env.example` para la configuración inicial.
 
+El inicio de sesión usa `POST /api/auth/login` por defecto y, si no se define
+`VITE_API_URL`, apunta a `http://localhost:8080`. El modo de simulación solo se
+activa de forma explícita con `VITE_AUTH_MODE=mock`; un fallo de conexión no
+convierte el login automáticamente a una sesión simulada.
+
 Los contratos preparados para la siguiente etapa son:
 
 - `POST /api/solicitantes`

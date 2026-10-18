@@ -1,4 +1,5 @@
 import { createContext, useContext, useState, type ReactNode } from "react"
+import { API_URL } from "../services/api"
 
 export type UserRole = "ADMINISTRADOR" | "ANALISTA"
 
@@ -67,6 +68,10 @@ function readStoredSession(): AuthSession | null {
       localStorage.removeItem(STORAGE_KEY)
       return null
     }
+    if (session.mode === "mock" && import.meta.env.VITE_AUTH_MODE !== "mock") {
+      localStorage.removeItem(STORAGE_KEY)
+      return null
+    }
     if (
       session.mode === "api" &&
       (typeof session.expiresAt !== "number" || Date.now() > session.expiresAt)
@@ -98,12 +103,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const login = async (email: string, password: string) => {
     const normalizedEmail = email.trim().toLowerCase()
-    const mockAccount = MOCK_ACCOUNTS.find(
-      (account) =>
-        account.email === normalizedEmail && account.password === password,
-    )
-
-    if (mockAccount) {
+    if (import.meta.env.VITE_AUTH_MODE === "mock") {
+      const mockAccount = MOCK_ACCOUNTS.find(
+        (account) =>
+          account.email === normalizedEmail && account.password === password,
+      )
+      if (!mockAccount) {
+        throw new Error("Credenciales inválidas para el modo de simulación.")
+      }
       const mockSession: AuthSession = {
         token: `mock-${mockAccount.role.toLowerCase()}-${Date.now()}`,
         tokenType: "Bearer",
@@ -116,16 +123,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       return
     }
 
-    const apiUrl = import.meta.env.VITE_API_URL
-    if (!apiUrl) {
-      throw new Error(
-        "Backend no configurado. Para usar el modo mock, ingrese una de las cuentas semilla.",
-      )
-    }
-
     let response: Response
     try {
-      response = await fetch(`${apiUrl.replace(/\/+$/, "")}/api/auth/login`, {
+      response = await fetch(`${API_URL.replace(/\/+$/, "")}/api/auth/login`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -134,9 +134,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         body: JSON.stringify({ email: normalizedEmail, password }),
       })
     } catch {
-      throw new Error(
-        "No se pudo conectar con el backend. Use las credenciales semilla para entrar en modo simulación.",
-      )
+      throw new Error("No se pudo conectar con el backend.")
     }
 
     if (!response.ok) throw new Error(await readErrorMessage(response))
