@@ -1,6 +1,11 @@
 import { useState, useEffect, useId } from "react"
 import { useAuth } from "../context/AuthContext"
 import {
+  ApiError,
+  crearPerfilFinanciero,
+  crearSolicitante,
+} from "../services/api"
+import {
   calculateWeightedScore,
   classifyRisk,
   loadScoringConfiguration,
@@ -77,21 +82,9 @@ type EvaluacionScore = {
   usedFallbackRanges: boolean
 }
 
-class ApiError extends Error {
-  status: number
-
-  constructor(status: number, message: string) {
-    super(message)
-    this.name = "ApiError"
-    this.status = status
-  }
-}
-
 function normalizarTexto(value: string) {
   return value.trim().replace(/\s+/g, " ")
 }
-
-const API_URL = import.meta.env.VITE_API_URL
 
 const TIPO_DOCUMENTO_API: Record<string, TipoDocumentoApi> = {
   "Cédula de Ciudadanía": "CC",
@@ -124,55 +117,14 @@ async function guardarSolicitante(
   payload: SolicitantePayload,
   token: string,
 ): Promise<unknown> {
-  if (!API_URL) throw new Error("La URL del backend no está configurada.")
-
-  const response = await fetch(`${API_URL}/api/solicitantes`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Accept: "application/json",
-      Authorization: `Bearer ${token}`,
-    },
-    body: JSON.stringify(payload),
-  })
-
-  if (!response.ok) {
-    const errorBody = await response.text()
-    throw new ApiError(
-      response.status,
-      errorBody || `Error al registrar solicitante: HTTP ${response.status}`,
-    )
-  }
-
-  return response.json()
+  return crearSolicitante(payload, token)
 }
 
 async function guardarDatosFinancieros(
   payload: PerfilFinancieroPayload,
   token: string,
 ): Promise<unknown> {
-  if (!API_URL) throw new Error("La URL del backend no está configurada.")
-
-  const response = await fetch(`${API_URL}/api/perfil-financiero`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Accept: "application/json",
-      Authorization: `Bearer ${token}`,
-    },
-    body: JSON.stringify(payload),
-  })
-
-  if (!response.ok) {
-    const errorBody = await response.text()
-    throw new ApiError(
-      response.status,
-      errorBody ||
-        `Error al guardar perfil financiero: HTTP ${response.status}`,
-    )
-  }
-
-  return response.json()
+  return crearPerfilFinanciero(payload, token)
 }
 
 const OPCIONES_MENU = [
@@ -523,8 +475,8 @@ function validarSolicitante(form: FormularioSolicitante): ErroresSolicitante {
   }
   if (!form.telefono.trim()) {
     e.telefono = "Este campo es obligatorio."
-  } else if (!/^\d{7,15}$/.test(form.telefono)) {
-    e.telefono = "Formato inválido: ingrese solo números (7 a 15 dígitos)."
+  } else if (!/^\d{7,10}$/.test(form.telefono)) {
+    e.telefono = "Formato inválido: ingrese solo números (7 a 10 dígitos)."
   }
   return e
 }
