@@ -1,21 +1,27 @@
 import { useEffect, useState, type FormEvent } from "react"
 import { useLocation, useNavigate } from "react-router-dom"
 import { useAuth, type UserRole } from "../context/AuthContext"
+import {
+  ApiError,
+  cambiarEstadoVariable,
+  crearVariable,
+  guardarFormula,
+  guardarRangos,
+  listarVariables,
+  obtenerFormulaVigente,
+  obtenerRangos,
+  type FormulaScoreResponse,
+  type VariableRiesgo,
+} from "../services/api"
+import BitacoraAuditoria from "../components/BitacoraAuditoria"
+import DashboardCartera from "../components/DashboardCartera"
+import HistorialEvaluaciones from "../components/HistorialEvaluaciones"
 import RegistroWizard from "../components/RegistroWizard"
-import { saveRiskRanges, saveScoringFormula } from "../utils/scoringConfig"
 
 type DataType = "NUMERICO" | "PORCENTAJE" | "CATEGORICO"
-type VariableStatus = "Activa" | "Inactiva"
-type Variable = {
-  id: number
-  name: string
-  category: string
-  dataType: DataType
-  weight: number
-  status: VariableStatus
-}
-type AdminView = "overview" | "variables" | "formula" | "ranges"
-type AnalystView = "solicitantes" | "simulacion"
+type AdminView = "cartera" | "overview" | "variables" | "formula" | "ranges" | "evaluaciones" | "auditoria"
+type AdminWorkspaceView = "overview" | "variables" | "formula" | "ranges"
+type AnalystView = "solicitantes" | "simulacion" | "evaluaciones"
 type RiskLevel = "Bajo" | "Medio" | "Alto"
 type RiskRange = { level: RiskLevel; min: string; max: string }
 
@@ -30,17 +36,49 @@ const ROLE_LABEL: Record<UserRole, string> = {
   ANALISTA: "Analista",
 }
 
-const INITIAL_VARIABLES: Variable[] = [
-  { id: 1, name: "Historial de pago", category: "Comportamiento", dataType: "NUMERICO", weight: 35, status: "Activa" },
-  { id: 2, name: "Capacidad de pago", category: "Financiera", dataType: "NUMERICO", weight: 30, status: "Activa" },
-  { id: 3, name: "Estabilidad laboral", category: "Estabilidad", dataType: "CATEGORICO", weight: 35, status: "Activa" },
+const ADMIN_VIEW_PATHS: Record<AdminView, string> = {
+  cartera: "/dashboard",
+  overview: "/dashboard/configuracion",
+  variables: "/dashboard/variables",
+  formula: "/dashboard/formula",
+  ranges: "/dashboard/rangos",
+  evaluaciones: "/dashboard/evaluaciones",
+  auditoria: "/dashboard/auditoria",
+}
+
+const EMPTY_RANGES: RiskRange[] = [
+  { level: "Bajo", min: "", max: "" },
+  { level: "Medio", min: "", max: "" },
+  { level: "Alto", min: "", max: "" },
 ]
 
-const INITIAL_RANGES: RiskRange[] = [
-  { level: "Bajo", min: "701", max: "1000" },
-  { level: "Medio", min: "301", max: "700" },
-  { level: "Alto", min: "0", max: "300" },
-]
+function errorDetail(error: unknown) {
+  if (error instanceof ApiError) return error.detail
+  if (error instanceof Error) return error.message
+  return "No fue posible completar la operación."
+}
+
+function normalizedRiskLevel(level: string): RiskLevel | null {
+  const normalized = level.trim().toLocaleLowerCase()
+  if (normalized === "bajo") return "Bajo"
+  if (normalized === "medio") return "Medio"
+  if (normalized === "alto") return "Alto"
+  return null
+}
+
+function formulaWeightsFromResponse(
+  variables: VariableRiesgo[],
+  formula: FormulaScoreResponse,
+) {
+  return Object.fromEntries(
+    variables.map((variable) => {
+      const savedWeight = formula.ponderaciones.find(
+        (item) => item.variableId === variable.id,
+      )?.peso
+      return [variable.id, String(savedWeight ?? variable.peso)]
+    }),
+  )
+}
 
 function validateRiskRanges(ranges: RiskRange[]) {
   const fieldErrors: Record<string, string> = {}
@@ -192,20 +230,82 @@ function AdminWorkspace({
   view,
   setView,
 }: {
-  view: AdminView
-  setView: (view: AdminView) => void
+  view: AdminWorkspaceView
+  setView: (view: AdminWorkspaceView) => void
 }) {
-  const [variables, setVariables] = useState(INITIAL_VARIABLES)
+  const { token } = useAuth()
+  const [variables, setVariables] = useState<VariableRiesgo[]>([])
   const [name, setName] = useState("")
-  const [category, setCategory] = useState("Financiera")
   const [dataType, setDataType] = useState<DataType>("NUMERICO")
   const [weight, setWeight] = useState("")
-  const [saved, setSaved] = useState(false)
-  const [ranges, setRanges] = useState(INITIAL_RANGES)
-  const [rangesSaved, setRangesSaved] = useState(false)
-  const activeVariables = variables.filter((variable) => variable.status === "Activa")
+  const [formulaWeights, setFormulaWeights] = useState<Record<number, string>>({})
+  const [ranges, setRanges] = useState<RiskRange[]>(EMPTY_RANGES)
+  const [loading, setLoading] = useState(true)
+  const [savingVariable, setSavingVariable] = useState(false)
+  const [pendingVariableId, setPendingVariableId] = useState<number | null>(null)
+  const [savingFormula, setSavingFormula] = useState(false)
+  const [savingRanges, setSavingRanges] = useState(false)
+  const [loadError, setLoadError] = useState("")
+  const [actionError, setActionError] = useState("")
+  const [actionSuccess, setActionSuccess] = useState("")
+
+  useEffect(() => {
+    if (!token) {
+      setLoadError("Debe iniciar sesión para cargar la configuración administrativa.")
+      setLoading(false)
+      return
+    }
+
+    let active = true
+    setLoading(true)
+    setLoadError("")
+    void Promise.all([
+      listarVariables(token),
+      obtenerFormulaVigente(token),
+      obtenerRangos(token).catch((error: unknown) => {
+        if (error instanceof ApiError && error.status === 404) return null
+        throw error
+      }),
+    ])
+      .then(([serverVariables, formula, rangosResponse]) => {
+        if (!active) return
+        setVariables(serverVariables)
+        setFormulaWeights(formulaWeightsFromResponse(serverVariables, formula))
+
+        const rangosDisponibles = new Map(
+          (rangosResponse?.rangos ?? []).flatMap((range) => {
+            const level = normalizedRiskLevel(range.nivel)
+            return level
+              ? [[level, { level, min: String(range.min), max: String(range.max) }] as const]
+              : []
+          }),
+        )
+        setRanges(
+          (["Bajo", "Medio", "Alto"] as const).map(
+            (level) => rangosDisponibles.get(level) ?? { level, min: "", max: "" },
+          ),
+        )
+      })
+      .catch((error: unknown) => {
+        if (active) setLoadError(errorDetail(error))
+      })
+      .finally(() => {
+        if (active) setLoading(false)
+      })
+
+    return () => {
+      active = false
+    }
+  }, [token])
+
+  const activeVariables = variables.filter((variable) => variable.estado === "Activa")
+  const activeVariableWeight = activeVariables.reduce(
+    (sum, variable) => sum + variable.peso,
+    0,
+  )
   const totalWeightUnits = activeVariables.reduce(
-    (sum, variable) => sum + Math.round(variable.weight * 10000),
+    (sum, variable) =>
+      sum + Math.round(Number(formulaWeights[variable.id] ?? variable.peso) * 10000),
     0,
   )
   const totalWeight = totalWeightUnits / 10000
@@ -213,100 +313,129 @@ function AdminWorkspace({
   const totalWeightLabel = totalWeight.toLocaleString("es-CO", { maximumFractionDigits: 4 })
   const weightDifference = Math.abs(1000000 - totalWeightUnits) / 10000
   const weightDifferenceLabel = weightDifference.toLocaleString("es-CO", { maximumFractionDigits: 4 })
-  const availableWeight = Math.max(0, 100 - totalWeight)
   const normalizedName = name.trim().toLocaleLowerCase()
   const duplicateName = Boolean(
     normalizedName &&
-      variables.some((variable) => variable.name.trim().toLocaleLowerCase() === normalizedName),
+      variables.some((variable) => variable.nombre.trim().toLocaleLowerCase() === normalizedName),
   )
   const rangeValidation = validateRiskRanges(ranges)
 
-  const addVariable = (event: FormEvent<HTMLFormElement>) => {
+  const addVariable = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     const numericWeight = Number(weight)
     if (
+      !token ||
       !name.trim() ||
       duplicateName ||
       weight.trim() === "" ||
       !Number.isFinite(numericWeight) ||
       numericWeight <= 0
     ) return
-    setVariables((current) => [
-      ...current,
-      {
-        id: Date.now(),
-        name: name.trim(),
-        category,
-        dataType,
-        weight: numericWeight,
-        status: "Activa",
-      },
-    ])
-    setName("")
-    setWeight("")
-    setDataType("NUMERICO")
-    setSaved(false)
+    setSavingVariable(true)
+    setActionError("")
+    setActionSuccess("")
+    try {
+      const created = await crearVariable(
+        { nombre: name.trim(), tipoDato: dataType, peso: numericWeight },
+        token,
+      )
+      setVariables((current) => [...current, created])
+      setFormulaWeights((current) => ({ ...current, [created.id]: String(created.peso) }))
+      setName("")
+      setWeight("")
+      setDataType("NUMERICO")
+      setActionSuccess(`Variable "${created.nombre}" creada correctamente.`)
+    } catch (error) {
+      setActionError(errorDetail(error))
+    } finally {
+      setSavingVariable(false)
+    }
   }
 
-  const toggleVariableStatus = (id: number) => {
-    setVariables((current) => current.map((variable) =>
-      variable.id === id
-        ? { ...variable, status: variable.status === "Activa" ? "Inactiva" : "Activa" }
-        : variable,
-    ))
-    setSaved(false)
+  const toggleVariableStatus = async (variable: VariableRiesgo) => {
+    if (!token) return
+    const nextStatus = variable.estado === "Activa" ? "Inactiva" : "Activa"
+    setPendingVariableId(variable.id)
+    setActionError("")
+    setActionSuccess("")
+    try {
+      const updated = await cambiarEstadoVariable(variable.id, nextStatus, token)
+      setVariables((current) =>
+        current.map((item) => (item.id === updated.id ? updated : item)),
+      )
+      const formula = await obtenerFormulaVigente(token)
+      setFormulaWeights(formulaWeightsFromResponse(variables, formula))
+      setActionSuccess(`Variable "${updated.nombre}" actualizada correctamente.`)
+    } catch (error) {
+      setActionError(errorDetail(error))
+    } finally {
+      setPendingVariableId(null)
+    }
   }
 
-  const updateVariableWeight = (id: number, value: string) => {
-    if (!value.trim()) return
-    const nextWeight = Number(value)
-    if (!Number.isFinite(nextWeight) || nextWeight <= 0) return
-    setVariables((current) => current.map((variable) =>
-      variable.id === id ? { ...variable, weight: nextWeight } : variable,
-    ))
-    setSaved(false)
+  const updateFormulaWeight = (id: number, value: string) => {
+    setFormulaWeights((current) => ({ ...current, [id]: value }))
+    setActionSuccess("")
   }
 
   const updateRange = (level: RiskLevel, bound: "min" | "max", value: string) => {
     setRanges((current) => current.map((range) =>
       range.level === level ? { ...range, [bound]: value } : range,
     ))
-    setRangesSaved(false)
+    setActionSuccess("")
   }
 
-  const persistFormula = () => {
+  const persistFormula = async () => {
+    if (!token) return
+    setSavingFormula(true)
+    setActionError("")
+    setActionSuccess("")
     try {
-      saveScoringFormula(
+      const formula = await guardarFormula(
         activeVariables.map((variable) => ({
-          id: variable.id,
-          name: variable.name,
-          dataType: variable.dataType,
-          weight: variable.weight,
-          status: "Activa" as const,
+          variableId: variable.id,
+          peso: Number(formulaWeights[variable.id] ?? variable.peso),
         })),
+        token,
       )
-      setSaved(true)
-    } catch {
-      setSaved(false)
+      setFormulaWeights(formulaWeightsFromResponse(variables, formula))
+      setActionSuccess(formula.mensaje)
+    } catch (error) {
+      setActionError(errorDetail(error))
+    } finally {
+      setSavingFormula(false)
     }
   }
 
-  const persistRanges = () => {
+  const persistRanges = async () => {
+    if (!token) return
+    setSavingRanges(true)
+    setActionError("")
+    setActionSuccess("")
     try {
-      saveRiskRanges(
+      const response = await guardarRangos(
         ranges.map((range) => ({
-          level: range.level,
+          nivel: range.level.toLocaleUpperCase() as "BAJO" | "MEDIO" | "ALTO",
           min: Number(range.min),
           max: Number(range.max),
         })),
+        token,
       )
-      setRangesSaved(true)
-    } catch {
-      setRangesSaved(false)
+      setRanges(
+        response.rangos.flatMap((range) => {
+          const level = normalizedRiskLevel(range.nivel)
+          return level ? [{ level, min: String(range.min), max: String(range.max) }] : []
+        }),
+      )
+      setActionSuccess(response.mensaje)
+    } catch (error) {
+      setActionError(errorDetail(error))
+    } finally {
+      setSavingRanges(false)
     }
   }
 
-  const menu: { id: AdminView; label: string }[] = [
+  const menu: { id: AdminWorkspaceView; label: string }[] = [
     { id: "overview", label: "Resumen" },
     { id: "variables", label: "Variables crediticias" },
     { id: "formula", label: "Fórmula de scoring" },
@@ -330,12 +459,17 @@ function AdminWorkspace({
         ))}
       </div>
 
+      {loading && <p className="text-sm text-slate-600" role="status" aria-live="polite">Cargando configuración desde el servidor…</p>}
+      {loadError && <p className="border-l-4 border-red-700 bg-red-50 px-4 py-3 text-sm text-red-800" role="alert">{loadError}</p>}
+      {actionError && <p className="border-l-4 border-red-700 bg-red-50 px-4 py-3 text-sm text-red-800" role="alert">{actionError}</p>}
+      {actionSuccess && <p className="border-l-4 border-emerald-700 bg-emerald-50 px-4 py-3 text-sm text-emerald-800" role="status" aria-live="polite">{actionSuccess}</p>}
+
       {view === "overview" && (
         <section>
           <p className="text-xs font-semibold uppercase tracking-wider text-blue-700">HU16 · HUS01</p>
           <h2 className="mt-2 text-2xl font-bold">Configuración del modelo de riesgo</h2>
           <p className="mt-2 max-w-2xl text-sm leading-6 text-slate-600">
-            Defina las variables crediticias y configure la ponderación de la fórmula. En modo mock, estos cambios viven solo en la sesión del navegador.
+            Defina las variables crediticias y configure la fórmula y los rangos que utiliza el backend.
           </p>
           <div className="mt-7 grid gap-5 sm:grid-cols-2">
             <button className="border border-slate-200 bg-white p-5 text-left hover:border-blue-500" onClick={() => setView("variables")} type="button">
@@ -365,24 +499,25 @@ function AdminWorkspace({
                 <h2 className="text-xl font-bold">Variables crediticias</h2>
                 <p className="mt-1 text-sm text-slate-600">Activa o inactiva criterios y conserva su historial.</p>
               </div>
-              <span className="text-sm font-semibold tabular-nums text-slate-600">{totalWeight.toLocaleString("es-CO", { maximumFractionDigits: 2 })}% activo</span>
+              <span className="text-sm font-semibold tabular-nums text-slate-600">{activeVariableWeight.toLocaleString("es-CO", { maximumFractionDigits: 2 })}% activo</span>
             </div>
             <ul className="divide-y divide-slate-200">
               {variables.map((variable) => (
-                <li className={`flex items-center justify-between gap-4 py-4 ${variable.status === "Inactiva" ? "bg-slate-50 opacity-50" : ""}`} key={variable.id}>
+                <li className={`flex items-center justify-between gap-4 py-4 ${variable.estado === "Inactiva" ? "bg-slate-50 opacity-50" : ""}`} key={variable.id}>
                   <div>
-                    <p className="text-sm font-semibold">{variable.name}</p>
-                    <p className="mt-1 text-xs text-slate-500">{variable.category} · {DATA_TYPE_LABEL[variable.dataType]} · {variable.status}</p>
+                    <p className="text-sm font-semibold">{variable.nombre}</p>
+                    <p className="mt-1 text-xs text-slate-500">{DATA_TYPE_LABEL[variable.tipoDato as DataType] ?? variable.tipoDato} · {variable.estado}</p>
                   </div>
                   <div className="flex items-center gap-3">
-                    <span className="text-sm font-semibold tabular-nums">{variable.weight.toLocaleString("es-CO", { maximumFractionDigits: 2 })}%</span>
+                    <span className="text-sm font-semibold tabular-nums">{variable.peso.toLocaleString("es-CO", { maximumFractionDigits: 2 })}%</span>
                     <button
-                      aria-pressed={variable.status === "Activa"}
-                      className={`min-w-24 border px-2 py-1.5 text-xs font-semibold ${variable.status === "Activa" ? "border-red-200 text-red-700 hover:bg-red-50" : "border-emerald-200 text-emerald-700 hover:bg-emerald-50"}`}
-                      onClick={() => toggleVariableStatus(variable.id)}
+                      aria-pressed={variable.estado === "Activa"}
+                      className={`min-w-24 border px-2 py-1.5 text-xs font-semibold ${variable.estado === "Activa" ? "border-red-200 text-red-700 hover:bg-red-50" : "border-emerald-200 text-emerald-700 hover:bg-emerald-50"}`}
+                      disabled={pendingVariableId === variable.id || loading}
+                      onClick={() => void toggleVariableStatus(variable)}
                       type="button"
                     >
-                      {variable.status === "Activa" ? "Inactivar" : "Activar"}
+                      {pendingVariableId === variable.id ? "Actualizando…" : variable.estado === "Activa" ? "Inactivar" : "Activar"}
                     </button>
                   </div>
                 </li>
@@ -404,12 +539,6 @@ function AdminWorkspace({
             </label>
             {duplicateName && <p className="-mt-2 text-sm text-red-700" id="variable-name-error" role="alert">Ya existe una variable registrada con este nombre</p>}
             <label className="block space-y-2 text-sm font-semibold">
-              Categoría
-              <select className="h-10 w-full border border-slate-300 bg-white px-3 font-normal" onChange={(event) => setCategory(event.target.value)} required value={category}>
-                <option>Financiera</option><option>Comportamiento</option><option>Estabilidad</option><option>Documental</option>
-              </select>
-            </label>
-            <label className="block space-y-2 text-sm font-semibold">
               Tipo de dato
               <select className="h-10 w-full border border-slate-300 bg-white px-3 font-normal" onChange={(event) => setDataType(event.target.value as DataType)} required value={dataType}>
                 <option value="NUMERICO">Numérico</option><option value="PORCENTAJE">Porcentaje</option><option value="CATEGORICO">Categórico</option>
@@ -420,33 +549,33 @@ function AdminWorkspace({
               <input className="h-10 w-full border border-slate-300 bg-white px-3 font-normal" min="0.0001" onChange={(event) => setWeight(event.target.value)} required step="0.0001" type="number" value={weight} />
             </label>
             <p className="text-xs text-slate-500">El peso debe ser mayor que 0%; el estado se asigna como Activa.</p>
-            <button className="h-10 bg-blue-700 px-4 text-sm font-semibold text-white hover:bg-blue-800 disabled:cursor-not-allowed disabled:bg-slate-300" disabled={duplicateName} type="submit">Agregar variable</button>
+            <button className="h-10 bg-blue-700 px-4 text-sm font-semibold text-white hover:bg-blue-800 disabled:cursor-not-allowed disabled:bg-slate-300" disabled={duplicateName || savingVariable || loading} type="submit">{savingVariable ? "Guardando…" : "Agregar variable"}</button>
           </form>
         </section>
       )}
 
       {view === "formula" && (
         <section className="max-w-3xl">
-          <p className="text-xs font-semibold uppercase tracking-wider text-blue-700">HUS01 · Configuración local</p>
+          <p className="text-xs font-semibold uppercase tracking-wider text-blue-700">HUS01 · Configuración administrativa</p>
           <h2 className="mt-2 text-xl font-bold">Fórmula de scoring</h2>
           <p className="mt-2 text-sm leading-6 text-slate-600">Asigne el porcentaje de cada variable activa. Las variables inactivas se conservan en el catálogo, pero no forman parte de la fórmula.</p>
           <div className="mt-6 divide-y divide-slate-200 border-y border-slate-200">
             {activeVariables.map((variable) => (
               <div className="flex items-center justify-between gap-4 py-4" key={variable.id}>
                 <div>
-                  <p className="text-sm font-medium">{variable.name}</p>
-                  <p className="mt-1 text-xs text-slate-500">{DATA_TYPE_LABEL[variable.dataType]}</p>
+                  <p className="text-sm font-medium">{variable.nombre}</p>
+                  <p className="mt-1 text-xs text-slate-500">{DATA_TYPE_LABEL[variable.tipoDato as DataType] ?? variable.tipoDato}</p>
                 </div>
                 <label className="flex items-center gap-2 text-sm font-semibold">
                   <input
-                    aria-label={`Porcentaje para ${variable.name}`}
+                    aria-label={`Porcentaje para ${variable.nombre}`}
                     className="h-10 w-28 border border-slate-300 px-2 text-right font-normal outline-none focus:border-blue-700"
                     max="100"
                     min="0.0001"
-                    onChange={(event) => updateVariableWeight(variable.id, event.target.value)}
+                    onChange={(event) => updateFormulaWeight(variable.id, event.target.value)}
                     step="0.0001"
                     type="number"
-                    value={variable.weight}
+                    value={formulaWeights[variable.id] ?? String(variable.peso)}
                   />
                   <span>%</span>
                 </label>
@@ -468,9 +597,8 @@ function AdminWorkspace({
               )}
               {formulaComplete && <p className="mt-1 text-sm text-emerald-700">La suma de ponderaciones es exactamente 100%.</p>}
             </div>
-            <button className="h-10 bg-blue-700 px-4 text-sm font-semibold text-white hover:bg-blue-800 disabled:cursor-not-allowed disabled:bg-slate-300" disabled={!formulaComplete || activeVariables.length === 0} onClick={persistFormula} type="button">Guardar Fórmula</button>
+            <button className="h-10 bg-blue-700 px-4 text-sm font-semibold text-white hover:bg-blue-800 disabled:cursor-not-allowed disabled:bg-slate-300" disabled={activeVariables.length === 0 || savingFormula || loading} onClick={() => void persistFormula()} type="button">{savingFormula ? "Guardando…" : "Guardar Fórmula"}</button>
           </div>
-          {saved && <p className="mt-3 text-sm text-emerald-700" role="status">Fórmula guardada correctamente en esta sesión.</p>}
         </section>
       )}
 
@@ -521,9 +649,8 @@ function AdminWorkspace({
             <p className={`text-sm font-semibold ${rangeValidation.valid ? "text-emerald-700" : "text-red-700"}`}>
               {rangeValidation.valid ? "Los rangos cubren la escala completa sin traslapes." : "Los rangos deben cubrir 0–1000 sin solapamientos ni vacíos."}
             </p>
-            <button className="h-10 bg-blue-700 px-4 text-sm font-semibold text-white hover:bg-blue-800 disabled:cursor-not-allowed disabled:bg-slate-300" disabled={!rangeValidation.valid} onClick={persistRanges} type="button">Guardar Rangos</button>
+            <button className="h-10 bg-blue-700 px-4 text-sm font-semibold text-white hover:bg-blue-800 disabled:cursor-not-allowed disabled:bg-slate-300" disabled={!rangeValidation.valid || savingRanges || loading} onClick={() => void persistRanges()} type="button">{savingRanges ? "Guardando…" : "Guardar Rangos"}</button>
           </div>
-          {rangesSaved && <p className="mt-3 text-sm text-emerald-700" role="status">Rangos guardados correctamente en esta sesión.</p>}
         </section>
       )}
     </div>
@@ -531,35 +658,46 @@ function AdminWorkspace({
 }
 
 export default function Dashboard({
-  initialAdminView = "overview",
+  initialAdminView = "cartera",
+  initialAnalystView = "solicitantes",
 }: {
   initialAdminView?: AdminView
+  initialAnalystView?: AnalystView
 }) {
   const { user, logout, authMode } = useAuth()
   const navigate = useNavigate()
   const location = useLocation()
   const [adminView, setAdminView] = useState<AdminView>(initialAdminView)
-  const [analystView, setAnalystView] = useState<AnalystView>("solicitantes")
+  const [analystView, setAnalystView] = useState<AnalystView>(
+    initialAdminView === "evaluaciones" ? "evaluaciones" : initialAnalystView,
+  )
   const accessDenied =
     (location.state as { accessDenied?: unknown } | null)?.accessDenied === true
 
   useEffect(() => {
     setAdminView(initialAdminView)
-  }, [initialAdminView])
+    setAnalystView(
+      initialAdminView === "evaluaciones" ? "evaluaciones" : initialAnalystView,
+    )
+  }, [initialAdminView, initialAnalystView])
 
   if (!user) return null
 
   const isAdmin = user.role === "ADMINISTRADOR"
   const menu = isAdmin
     ? [
-        { id: "overview" as const, label: "Panel" },
+        { id: "cartera" as const, label: "Dashboard de cartera" },
+        { id: "overview" as const, label: "Configuración general" },
         { id: "variables" as const, label: "Variables crediticias" },
         { id: "formula" as const, label: "Fórmula de scoring" },
         { id: "ranges" as const, label: "Configuración de Rangos" },
+        { id: "evaluaciones" as const, label: "Evaluaciones" },
+        { id: "auditoria" as const, label: "Bitácora de auditoría" },
       ]
     : [
         { id: "solicitantes" as const, label: "Solicitantes" },
         { id: "simulacion" as const, label: "Simulación de score" },
+        { id: "evaluaciones" as const, label: "Evaluaciones" },
       ]
 
   const signOut = () => {
@@ -583,9 +721,20 @@ export default function Dashboard({
             return (
               <button
                 aria-current={active ? "page" : undefined}
+                aria-label={item.label}
                 className={`block w-full border-l-2 px-3 py-3 text-left text-sm transition max-sm:px-0 max-sm:text-center ${active ? "border-blue-400 bg-slate-800 font-semibold text-white" : "border-transparent text-slate-300 hover:bg-slate-800"}`}
                 key={item.id}
-                onClick={() => isAdmin ? setAdminView(item.id as AdminView) : setAnalystView(item.id as AnalystView)}
+                onClick={() => {
+                  if (isAdmin) {
+                    navigate(ADMIN_VIEW_PATHS[item.id as AdminView])
+                  } else if (item.id === "evaluaciones") {
+                    navigate("/dashboard/evaluaciones")
+                  } else if (item.id === "simulacion") {
+                    navigate("/dashboard/simulacion")
+                  } else {
+                    navigate("/dashboard")
+                  }
+                }}
                 type="button"
               >
                 <span className="max-sm:hidden">{item.label}</span>
@@ -604,7 +753,21 @@ export default function Dashboard({
         <header className="flex min-h-[72px] items-center justify-between border-b border-slate-200 bg-white px-5 sm:px-8">
           <div>
             <p className="text-xs font-semibold uppercase tracking-wider text-blue-700">{ROLE_LABEL[user.role]}</p>
-            <h1 className="text-lg font-bold">{isAdmin ? "Administración del modelo" : "Gestión de solicitantes"}</h1>
+            <h1 className="text-lg font-bold">
+              {isAdmin
+                ? adminView === "auditoria"
+                  ? "Bitácora de auditoría"
+                  : adminView === "evaluaciones"
+                    ? "Evaluaciones de scoring"
+                    : adminView === "cartera"
+                      ? "Distribución de riesgo de cartera"
+                      : "Administración del modelo"
+                : analystView === "evaluaciones"
+                  ? "Evaluaciones de scoring"
+                  : analystView === "simulacion"
+                    ? "Simulación de score"
+                    : "Gestión de solicitantes"}
+            </h1>
           </div>
           <div className="flex items-center gap-4">
             <div className="hidden text-right sm:block">
@@ -632,9 +795,24 @@ export default function Dashboard({
             </div>
           )}
           {isAdmin ? (
-            <AdminWorkspace view={adminView} setView={setAdminView} />
+            adminView === "auditoria" ? (
+              <BitacoraAuditoria />
+            ) : adminView === "evaluaciones" ? (
+              <HistorialEvaluaciones />
+            ) : adminView === "cartera" ? (
+              <DashboardCartera />
+            ) : (
+              <AdminWorkspace
+                view={adminView}
+                setView={(view) => setAdminView(view)}
+              />
+            )
+          ) : analystView === "solicitantes" ? (
+            <RegistroWizard embedded />
+          ) : analystView === "simulacion" ? (
+            <ScoreSimulator />
           ) : (
-            analystView === "solicitantes" ? <RegistroWizard embedded /> : <ScoreSimulator />
+            <HistorialEvaluaciones />
           )}
         </main>
       </div>

@@ -28,6 +28,38 @@ export default function App() {
             }
           />
           <Route
+            path="/dashboard/simulacion"
+            element={
+              <ProtectedRoute allowedRoles={[...ROLES_PERMITIDOS]}>
+                <Dashboard initialAnalystView="simulacion" />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="/dashboard/configuracion"
+            element={
+              <ProtectedRoute allowedRoles={[...SOLO_ADMINISTRADOR]}>
+                <Dashboard initialAdminView="overview" />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="/dashboard/evaluaciones"
+            element={
+              <ProtectedRoute allowedRoles={[...ROLES_PERMITIDOS]}>
+                <Dashboard initialAdminView="evaluaciones" />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="/dashboard/auditoria"
+            element={
+              <ProtectedRoute allowedRoles={[...SOLO_ADMINISTRADOR]}>
+                <Dashboard initialAdminView="auditoria" />
+              </ProtectedRoute>
+            }
+          />
+          <Route
             path="/dashboard/variables"
             element={
               <ProtectedRoute allowedRoles={[...SOLO_ADMINISTRADOR]}>

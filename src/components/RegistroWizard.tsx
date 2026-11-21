@@ -1,18 +1,17 @@
-import { useState, useEffect, useId } from "react"
+import { useState, useEffect, useId, useRef } from "react"
 import { useAuth } from "../context/AuthContext"
 import {
   ApiError,
+  calcularRiesgoSolicitante,
   crearPerfilFinanciero,
   crearSolicitante,
+  listarVariables,
+  verificarSolicitanteExiste,
+  type CalculoRiesgoResponse,
+  type SolicitanteResponse,
+  type ValorVariableRequest,
+  type VariableRiesgo,
 } from "../services/api"
-import {
-  calculateWeightedScore,
-  classifyRisk,
-  loadScoringConfiguration,
-  scoreVariableValue,
-  type RiskLevel,
-  type ScoringConfiguration,
-} from "../utils/scoringConfig"
 
 const RUTA_ASSETS = "/assets/"
 
@@ -75,11 +74,7 @@ type ErroresFinancieros = Record<string, string>
 type EvaluacionScore = {
   ing: number
   eg: number
-  score: number
-  risk: RiskLevel
-  evaluatedAt: string
-  usedFallbackFormula: boolean
-  usedFallbackRanges: boolean
+  resultado: CalculoRiesgoResponse
 }
 
 function normalizarTexto(value: string) {
@@ -116,7 +111,7 @@ function normalizarSolicitante(
 async function guardarSolicitante(
   payload: SolicitantePayload,
   token: string,
-): Promise<unknown> {
+): Promise<SolicitanteResponse> {
   return crearSolicitante(payload, token)
 }
 
@@ -424,29 +419,11 @@ const OPCIONES_TIPO_DOCUMENTO = [
   "Tarjeta de Identidad",
 ]
 
-const DOCUMENTOS_DUPLICADOS: Record<string, string[]> = {
-  "Cédula de Ciudadanía": ["1023456789"],
-}
-
 const TIPOS_DOCUMENTO_NUMERICOS = new Set([
   "Cédula de Ciudadanía",
   "Cédula de Extranjería",
   "Tarjeta de Identidad",
 ])
-
-// Consulta el mock local de solicitantes; puede sustituirse por una llamada al backend.
-function consultarDuplicadoLocal(tipoDoc: string, numDoc: string) {
-  const normalizedDocument = numDoc.replace(/\s/g, "").trim()
-  return DOCUMENTOS_DUPLICADOS[tipoDoc]?.includes(normalizedDocument) ?? false
-}
-
-// Mantiene la misma interfaz asíncrona que tendrá la consulta real al backend.
-async function verificarDocumentoDuplicado(
-  tipoDoc: string,
-  numDoc: string,
-): Promise<boolean> {
-  return Promise.resolve(consultarDuplicadoLocal(tipoDoc, numDoc))
-}
 
 function esDocumentoNumerico(tipoDoc: string) {
   return TIPOS_DOCUMENTO_NUMERICOS.has(tipoDoc)
@@ -464,9 +441,6 @@ function validarSolicitante(form: FormularioSolicitante): ErroresSolicitante {
     !/^\d{6,15}$/.test(form.numDoc.trim())
   ) {
     e.numDoc = "Formato inválido: ingrese solo números (6 a 15 dígitos)."
-  } else if (consultarDuplicadoLocal(form.tipoDoc, form.numDoc)) {
-    e.numDoc =
-      "El solicitante con este tipo y número de documento ya se encuentra registrado en la plataforma."
   }
   if (!form.correo.trim()) {
     e.correo = "Este campo es obligatorio."
@@ -484,9 +458,11 @@ function validarSolicitante(form: FormularioSolicitante): ErroresSolicitante {
 function PasoRegistro({
   onSuccess,
   isSavingSolicitante,
+  token,
 }: {
   onSuccess: (d: SolicitantePayload) => void | Promise<void>
   isSavingSolicitante: boolean
+  token: string | null
 }) {
   const uid = useId()
   const [form, setForm] = useState<FormularioSolicitante>({
@@ -503,50 +479,69 @@ function PasoRegistro({
   const [submitted, setSubmitted] = useState(false)
   const [isDuplicate, setIsDuplicate] = useState(false)
   const [isCheckingDuplicate, setIsCheckingDuplicate] = useState(false)
+  const duplicateCheckSequence = useRef(0)
 
-  useEffect(() => {
-    const documentNumber = form.numDoc.trim()
-    const documentIsValid =
-      Boolean(documentNumber) &&
-      (!esDocumentoNumerico(form.tipoDoc) || /^\d{6,15}$/.test(documentNumber))
-
-    if (!documentIsValid) {
-      setIsDuplicate(false)
-      setIsCheckingDuplicate(false)
-      return
+  const checkDuplicate = async (target: FormularioSolicitante) => {
+    const documentNumber = target.numDoc.replace(/\s/g, "").trim()
+    if (
+      !documentNumber ||
+      (esDocumentoNumerico(target.tipoDoc) && !/^\d{6,15}$/.test(documentNumber))
+    ) {
+      return false
+    }
+    if (!token) {
+      setErrors((previous) => ({
+        ...previous,
+        numDoc: "Debe iniciar sesión para verificar el documento.",
+      }))
+      return true
     }
 
-    let cancelled = false
-    setIsDuplicate(false)
+    const sequence = ++duplicateCheckSequence.current
     setIsCheckingDuplicate(true)
-
-    void verificarDocumentoDuplicado(form.tipoDoc, documentNumber).then(
-      (duplicate) => {
-        if (cancelled) return
-        setIsDuplicate(duplicate)
+    try {
+      const { existe } = await verificarSolicitanteExiste(
+        obtenerTipoDocumentoApi(target.tipoDoc),
+        documentNumber,
+        token,
+      )
+      if (sequence !== duplicateCheckSequence.current) return false
+      setIsDuplicate(existe)
+      setErrors((previous) => {
+        const next = { ...previous }
+        if (existe) {
+          next.numDoc = "El solicitante con este tipo y número de documento ya se encuentra registrado."
+        } else if (next.numDoc?.includes("ya se encuentra registrado")) {
+          delete next.numDoc
+        }
+        return next
+      })
+      return existe
+    } catch (error) {
+      if (sequence === duplicateCheckSequence.current) {
+        setErrors((previous) => ({
+          ...previous,
+          numDoc:
+            error instanceof Error
+              ? error.message
+              : "No fue posible verificar el documento con el backend.",
+        }))
+      }
+      return true
+    } finally {
+      if (sequence === duplicateCheckSequence.current) {
         setIsCheckingDuplicate(false)
-      },
-    )
-
-    return () => {
-      cancelled = true
+      }
     }
-  }, [form.tipoDoc, form.numDoc])
+  }
 
   const validationErrors = validarSolicitante(form)
-  const active = submitted
-    ? validationErrors
-    : isDuplicate
-      ? {
-          ...errors,
-          numDoc:
-            "El solicitante con este tipo y número de documento ya se encuentra registrado en la plataforma.",
-        }
-      : errors
+  const active = submitted ? { ...errors, ...validationErrors } : errors
   const hasErrors = Object.keys(active).length > 0
   const hasValidationErrors =
     Object.keys(validationErrors).length > 0 ||
     isDuplicate ||
+    Boolean(active.numDoc) ||
     isCheckingDuplicate
 
   const set =
@@ -554,34 +549,50 @@ function PasoRegistro({
     (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
       const next = { ...form, [f]: e.target.value }
       setForm(next)
-      if (
-        touched[f] ||
-        submitted ||
-        f === "numDoc" ||
-        (f === "tipoDoc" && next.numDoc.trim())
-      )
-        setErrors(validarSolicitante(next))
+      if (f === "numDoc" || f === "tipoDoc") {
+        duplicateCheckSequence.current += 1
+        setIsDuplicate(false)
+        setIsCheckingDuplicate(false)
+      }
+      const fieldErrors = validarSolicitante(next)
+      const fieldsToUpdate: (keyof FormularioSolicitante)[] =
+        f === "tipoDoc" ? [f, "numDoc"] : [f]
+      setErrors((previous) => {
+        const updated = { ...previous }
+        for (const field of fieldsToUpdate) {
+          if (fieldErrors[field]) updated[field] = fieldErrors[field]
+          else delete updated[field]
+        }
+        return updated
+      })
     }
 
-  const blur = (f: keyof FormularioSolicitante) => () => {
+  const blur =
+    (f: keyof FormularioSolicitante) =>
+    (event: React.FocusEvent<HTMLInputElement | HTMLSelectElement>) => {
+      const currentForm = { ...form, [f]: event.currentTarget.value }
+      setForm(currentForm)
     setTouched((t) => ({ ...t, [f]: true }))
-    setErrors(validarSolicitante(form))
-  }
+      setErrors(validarSolicitante(currentForm))
+      if (f === "numDoc" || f === "tipoDoc") void checkDuplicate(currentForm)
+    }
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault()
     setSubmitted(true)
     const errs = validationErrors
     setErrors(errs)
-    if (
-      Object.keys(errs).length === 0 &&
-      !isDuplicate &&
-      !isCheckingDuplicate
-    ) {
+    if (Object.keys(errs).length === 0 && !(await checkDuplicate(form))) {
       try {
         await onSuccess(normalizarSolicitante(form))
-      } catch {
-        setErrors({ numDoc: "No fue posible preparar el registro." })
+      } catch (error) {
+        if (
+          error instanceof ApiError &&
+          error.status === 409 &&
+          error.campo === "numeroDocumento"
+        ) {
+          setErrors((previous) => ({ ...previous, numDoc: error.detail }))
+        }
       }
     }
   }
@@ -862,21 +873,9 @@ function parseFinancialAmount(value: string): number | null {
   return numericValue
 }
 
-function isCapacityVariable(name: string) {
-  return name.trim().toLocaleLowerCase() === "capacidad de pago"
-}
-
-function calcularCapacidadDePago(form: FormularioFinanciero) {
-  const ingresos = parseFinancialAmount(form.ingresos)
-  const egresos = parseFinancialAmount(form.egresos)
-  if (ingresos === null || egresos === null) return null
-  if (ingresos === 0) return 0
-  return Math.round(Math.max(0, Math.min(1000, ((ingresos - egresos) / ingresos) * 1000)))
-}
-
 function validarFinanzas(
   form: FormularioFinanciero,
-  scoring: ScoringConfiguration,
+  variables: VariableRiesgo[],
   variableValues: Record<string, string>,
 ): ErroresFinancieros {
   const e: ErroresFinancieros = {}
@@ -894,19 +893,14 @@ function validarFinanzas(
     e.egresos =
       "El valor ingresado no es válido. Debe ser un monto numérico no negativo."
   }
-  for (const variable of scoring.variables) {
-    if (isCapacityVariable(variable.name)) continue
+  for (const variable of variables) {
     const key = `variable-${variable.id}`
     const value = variableValues[String(variable.id)] ?? ""
-    if (!value.trim()) {
-      e[key] = "Este valor es obligatorio para calcular el score."
-    } else if (scoreVariableValue(value, variable.dataType) === null) {
-      e[key] =
-        variable.dataType === "NUMERICO"
-          ? "Ingrese un valor entre 0 y 1000."
-          : variable.dataType === "PORCENTAJE"
-            ? "Ingrese un porcentaje entre 0 y 100."
-            : "Seleccione una opción válida."
+    if (value.trim()) {
+      const numericValue = Number(value)
+      if (!Number.isFinite(numericValue) || numericValue < 0 || numericValue > 100) {
+        e[key] = "Ingrese un valor numérico entre 0 y 100."
+      }
     }
   }
   return e
@@ -916,20 +910,28 @@ function PasoFinanciero({
   onSuccess,
   onBack,
   isSavingFinanciero,
+  calculationError,
+  onClearCalculationError,
+  token,
   hidden = false,
 }: {
   onSuccess: (
     ing: number,
     eg: number,
     variableValues: Record<string, string>,
-    scoring: ScoringConfiguration,
+    variables: VariableRiesgo[],
   ) => void
   onBack: () => void
   isSavingFinanciero: boolean
+  calculationError: ApiError | null
+  onClearCalculationError: () => void
+  token: string | null
   hidden?: boolean
 }) {
   const uid = useId()
-  const [scoring] = useState(loadScoringConfiguration)
+  const [variables, setVariables] = useState<VariableRiesgo[]>([])
+  const [variablesLoading, setVariablesLoading] = useState(true)
+  const [variablesError, setVariablesError] = useState("")
   const [form, setForm] = useState<FormularioFinanciero>({
     ingresos: "",
     egresos: "",
@@ -938,15 +940,45 @@ function PasoFinanciero({
   const [variableValues, setVariableValues] = useState<Record<string, string>>({})
   const [submitted, setSubmitted] = useState(false)
 
-  const validationErrors = validarFinanzas(form, scoring, variableValues)
+  useEffect(() => {
+    if (!token) {
+      setVariablesError("Debe iniciar sesión para cargar las variables de riesgo.")
+      setVariablesLoading(false)
+      return
+    }
+
+    let active = true
+    setVariablesLoading(true)
+    setVariablesError("")
+    void listarVariables(token)
+      .then((result) => {
+        if (active) setVariables(result.filter((variable) => variable.estado === "Activa"))
+      })
+      .catch((error: unknown) => {
+        if (!active) return
+        setVariablesError(
+          error instanceof ApiError
+            ? error.detail
+            : error instanceof Error
+              ? error.message
+              : "No fue posible cargar las variables de riesgo.",
+        )
+      })
+      .finally(() => {
+        if (active) setVariablesLoading(false)
+      })
+
+    return () => {
+      active = false
+    }
+  }, [token])
+
+  const validationErrors = validarFinanzas(form, variables, variableValues)
   const active = submitted ? validationErrors : errors
   const hasErrors = Object.keys(active).length > 0
   const missingFields = [
     validationErrors.ingresos ? "Ingresos Mensuales" : null,
     validationErrors.egresos ? "Egresos Fijos" : null,
-    ...scoring.variables
-      .filter((variable) => validationErrors[`variable-${variable.id}`])
-      .map((variable) => variable.name),
   ].filter((field): field is string => field !== null)
   const currentIngresos = parseFinancialAmount(form.ingresos)
   const currentEgresos = parseFinancialAmount(form.egresos)
@@ -960,36 +992,32 @@ function PasoFinanciero({
     (e: React.ChangeEvent<HTMLInputElement>) => {
       const next = { ...form, [f]: e.target.value }
       setForm(next)
-      if (submitted) setErrors(validarFinanzas(next, scoring, variableValues))
+      onClearCalculationError()
+      if (submitted) setErrors(validarFinanzas(next, variables, variableValues))
     }
 
   const blur = () => {
-    if (!submitted) setErrors(validarFinanzas(form, scoring, variableValues))
+    if (!submitted) setErrors(validarFinanzas(form, variables, variableValues))
   }
 
   const setVariableValue = (id: number, value: string) => {
     const next = { ...variableValues, [String(id)]: value }
     setVariableValues(next)
-    if (submitted) setErrors(validarFinanzas(form, scoring, next))
+    onClearCalculationError()
+    if (submitted) setErrors(validarFinanzas(form, variables, next))
   }
 
   const submit = (e: React.FormEvent) => {
     e.preventDefault()
     setSubmitted(true)
-    const errs = validarFinanzas(form, scoring, variableValues)
+    onClearCalculationError()
+    const errs = validarFinanzas(form, variables, variableValues)
     setErrors(errs)
     if (Object.keys(errs).length === 0) {
       const ingresos = parseFinancialAmount(form.ingresos)
       const egresos = parseFinancialAmount(form.egresos)
       if (ingresos !== null && egresos !== null) {
-        const valuesForScore = { ...variableValues }
-        for (const variable of scoring.variables) {
-          if (isCapacityVariable(variable.name)) {
-            const capacity = calcularCapacidadDePago(form)
-            if (capacity !== null) valuesForScore[String(variable.id)] = String(capacity)
-          }
-        }
-        onSuccess(ingresos, egresos, valuesForScore, scoring)
+        onSuccess(ingresos, egresos, variableValues, variables)
       }
     }
   }
@@ -1035,6 +1063,35 @@ function PasoFinanciero({
             <p className="font-['Geist:Medium'] font-medium text-[#92400e] text-[13px] flex-1 min-w-0">
               Completa o corrige los campos requeridos antes de calcular: {missingFields.join(", ")}.
             </p>
+          </div>
+        )}
+
+        {calculationError && (
+          <div
+            role="alert"
+            aria-live="polite"
+            aria-atomic="true"
+            className="w-full rounded-lg border-l-4 border-[#f59e0b] bg-[#fffbeb] p-4 text-[#92400e]"
+          >
+            <p className="font-['Geist:SemiBold'] text-[13px]">
+              {calculationError.detail}
+            </p>
+            {calculationError.camposFaltantes &&
+              calculationError.camposFaltantes.length > 0 && (
+                <ul className="mt-2 list-disc pl-5 text-[13px]">
+                  {calculationError.camposFaltantes.map((field, index) => (
+                    <li key={`${field}-${index}`}>{field}</li>
+                  ))}
+                </ul>
+              )}
+            {calculationError.variablesFaltantes &&
+              calculationError.variablesFaltantes.length > 0 && (
+                <ul className="mt-2 list-disc pl-5 text-[13px]">
+                  {calculationError.variablesFaltantes.map((variable, index) => (
+                    <li key={`${variable}-${index}`}>{variable}</li>
+                  ))}
+                </ul>
+              )}
           </div>
         )}
 
@@ -1137,78 +1194,43 @@ function PasoFinanciero({
         <section className="flex w-full flex-col gap-4 border-t border-[#e2e8f0] pt-6" aria-labelledby={fid("scoring-vars-heading")}>
           <div>
             <h3 className="font-['Geist:SemiBold'] font-semibold text-[#0f172a] text-base" id={fid("scoring-vars-heading")}>
-              Variables requeridas para el score
+              Variables de riesgo
             </h3>
             <p className="mt-1 text-xs text-[#64748b]">
-              {scoring.usingFallbackFormula
-                ? "No hay fórmula guardada; se aplica la fórmula predeterminada. "
-                : "Se usa la fórmula vigente guardada por el administrador. "}
-              Numérico: escala 0–1000. Porcentaje: escala 0–100. Categórico: seleccione una opción. La capacidad de pago se deriva de ingresos y egresos.
+              Ingrese un valor numérico de 0 a 100 por variable. Puede dejarlo vacío; el backend indicará los datos faltantes.
             </p>
-            {scoring.usingFallbackRanges && (
-              <p className="mt-1 text-xs text-[#64748b]">La clasificación usa los rangos predeterminados porque no hay rangos guardados.</p>
-            )}
           </div>
 
+          {variablesLoading && <p className="text-sm text-slate-600" role="status" aria-live="polite">Cargando variables activas desde el servidor…</p>}
+          {variablesError && <p className="text-sm text-red-700" role="alert">{variablesError}</p>}
+          {!variablesLoading && !variablesError && variables.length === 0 && (
+            <p className="text-sm text-slate-600">No hay variables activas configuradas en el backend.</p>
+          )}
           <div className="grid gap-4 sm:grid-cols-2">
-            {scoring.variables.map((variable) => {
+            {variables.map((variable) => {
               const key = `variable-${variable.id}`
               const fieldId = fid(key)
               const value = variableValues[String(variable.id)] ?? ""
               const message = active[key]
               return (
                 <div className="flex flex-col gap-2" key={variable.id}>
-                  {isCapacityVariable(variable.name) ? (
-                    <>
-                      <p className="font-['Geist:SemiBold'] font-semibold text-[#475569] text-[13px]">
-                        {variable.name} <span className="font-normal">({variable.weight}%)</span>
-                      </p>
-                      <div className="flex h-[42px] items-center border border-[#cbd5e1] bg-slate-50 px-3.5 text-sm text-slate-700" id={fieldId}>
-                        {calcularCapacidadDePago(form) === null
-                          ? "Complete ingresos y egresos"
-                          : `${calcularCapacidadDePago(form)} / 1000`}
-                      </div>
-                    </>
-                  ) : (
-                    <>
-                      <label className="font-['Geist:SemiBold'] font-semibold text-[#475569] text-[13px]" htmlFor={fieldId}>
-                        {variable.name} <span className="font-normal">({variable.weight}%)</span>
-                      </label>
-                      {variable.dataType === "NUMERICO" || variable.dataType === "PORCENTAJE" ? (
-                        <input
-                          aria-describedby={eid(key)}
-                          aria-invalid={Boolean(message)}
-                          className={`h-[42px] w-full rounded-lg border px-3.5 text-sm outline-none ${message ? "border-[#ef4444] bg-[#fef2f2]" : "border-[#cbd5e1] bg-white focus:border-[#2563eb]"}`}
-                          id={fieldId}
-                          max={variable.dataType === "PORCENTAJE" ? "100" : "1000"}
-                          min="0"
-                          onBlur={blur}
-                          onChange={(event) => setVariableValue(variable.id, event.target.value)}
-                          placeholder={variable.dataType === "PORCENTAJE" ? "0 a 100" : "0 a 1000"}
-                          step="1"
-                          type="number"
-                          value={value}
-                        />
-                      ) : (
-                        <select
-                          aria-describedby={eid(key)}
-                          aria-invalid={Boolean(message)}
-                          className={`h-[42px] w-full rounded-lg border px-3.5 text-sm outline-none ${message ? "border-[#ef4444] bg-[#fef2f2]" : "border-[#cbd5e1] bg-white focus:border-[#2563eb]"}`}
-                          id={fieldId}
-                          onBlur={blur}
-                          onChange={(event) => setVariableValue(variable.id, event.target.value)}
-                          value={value}
-                        >
-                          <option value="">Seleccione una opción</option>
-                          {variable.dataType === "CATEGORICO" ? (
-                            <><option value="Sí">Sí</option><option value="No">No</option></>
-                          ) : (
-                            <><option>Muy favorable</option><option>Favorable</option><option>Neutral</option><option>Desfavorable</option><option>Muy desfavorable</option></>
-                          )}
-                        </select>
-                      )}
-                    </>
-                  )}
+                  <label className="font-['Geist:SemiBold'] font-semibold text-[#475569] text-[13px]" htmlFor={fieldId}>
+                    {variable.nombre}
+                  </label>
+                  <input
+                    aria-describedby={eid(key)}
+                    aria-invalid={Boolean(message)}
+                    className={`h-[42px] w-full rounded-lg border px-3.5 text-sm outline-none ${message ? "border-[#ef4444] bg-[#fef2f2]" : "border-[#cbd5e1] bg-white focus:border-[#2563eb]"}`}
+                    id={fieldId}
+                    max="100"
+                    min="0"
+                    onBlur={blur}
+                    onChange={(event) => setVariableValue(variable.id, event.target.value)}
+                    placeholder="0 a 100"
+                    step="any"
+                    type="number"
+                    value={value}
+                  />
                   <MensajeError id={eid(key)} message={message} />
                 </div>
               )
@@ -1244,10 +1266,10 @@ function PasoFinanciero({
         <div className="flex flex-col gap-3 w-full">
           <button
             type="submit"
-            disabled={isSavingFinanciero}
-            aria-disabled={isSavingFinanciero}
+            disabled={isSavingFinanciero || variablesLoading || Boolean(variablesError) || variables.length === 0}
+            aria-disabled={isSavingFinanciero || variablesLoading || Boolean(variablesError) || variables.length === 0}
             className={`flex gap-2 h-[46px] items-center justify-center rounded-lg w-full transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#2563eb] ${
-              isSavingFinanciero
+              isSavingFinanciero || variablesLoading || Boolean(variablesError) || variables.length === 0
                 ? "bg-[#e2e8f0] cursor-not-allowed"
                 : "bg-[#2563eb] hover:bg-[#1d4ed8] cursor-pointer"
             }`}
@@ -1263,7 +1285,7 @@ function PasoFinanciero({
             </div>
             <span
               className={`font-['Geist:SemiBold'] font-semibold text-sm whitespace-nowrap ${
-                isSavingFinanciero
+                  isSavingFinanciero || variablesLoading || Boolean(variablesError) || variables.length === 0
                   ? "text-[#94a3b8]"
                   : "text-white"
               }`}
@@ -1304,28 +1326,25 @@ function formatearFechaEvaluacion(value: string) {
 function ResumenFinanciero({
   ingresos,
   egresos,
-  score,
-  risk,
-  evaluatedAt,
-  usedFallbackFormula,
+  resultado,
   onBack,
   onReset,
 }: {
   ingresos: number
   egresos: number
-  score: number
-  risk: RiskLevel
-  evaluatedAt: string
-  usedFallbackFormula: boolean
+  resultado: CalculoRiesgoResponse
   onBack: () => void
   onReset: () => void
 }) {
   const neto = ingresos - egresos
-  const riskStyles: Record<RiskLevel, string> = {
-    Bajo: "border-emerald-200 bg-emerald-50 text-emerald-800",
-    Medio: "border-amber-200 bg-amber-50 text-amber-800",
-    Alto: "border-red-200 bg-red-50 text-red-800",
-  }
+  const nivelNormalizado = resultado.nivel.trim().toLocaleLowerCase()
+  const riskStyle = nivelNormalizado === "bajo"
+    ? "border-emerald-200 bg-emerald-50 text-emerald-800"
+    : nivelNormalizado === "medio"
+      ? "border-amber-200 bg-amber-50 text-amber-800"
+      : nivelNormalizado === "alto"
+        ? "border-red-200 bg-red-50 text-red-800"
+        : "border-slate-200 bg-slate-50 text-slate-800"
 
   return (
     <div className="bg-white border border-[#e2e8f0] shadow-[0_4px_10px_rgba(0,0,0,0.03)] flex flex-col gap-8 items-start p-10 rounded-2xl w-full max-w-[820px] mx-auto">
@@ -1334,21 +1353,20 @@ function ResumenFinanciero({
           Resumen Financiero del Solicitante
         </h2>
         <p className="font-['Geist:Regular'] font-normal text-[#64748b] text-[13px]">
-          Resumen calculado automáticamente a partir de los datos financieros
-          ingresados.
+          Resultado oficial del cálculo de riesgo generado por el backend.
         </p>
       </div>
 
-      <section className={`flex w-full flex-wrap items-center justify-between gap-5 border p-5 ${riskStyles[risk]}`} aria-live="polite">
+      <section className={`flex w-full flex-wrap items-center justify-between gap-5 border p-5 ${riskStyle}`} aria-live="polite">
         <div>
           <p className="text-xs font-semibold uppercase tracking-wider">Puntaje de riesgo crediticio</p>
-          <p className="mt-1 text-4xl font-bold tabular-nums">{score} <span className="text-base font-semibold">pts</span></p>
+          <p className="mt-1 text-4xl font-bold tabular-nums">{resultado.puntaje} <span className="text-base font-semibold">pts</span></p>
         </div>
         <div className="flex flex-col gap-2 sm:items-end">
-          <span className="inline-flex border border-current px-3 py-1 text-sm font-bold">Riesgo {risk}</span>
-          <p className="text-xs font-medium">Última evaluación: {formatearFechaEvaluacion(evaluatedAt)}</p>
+          <span className="inline-flex border border-current px-3 py-1 text-sm font-bold">Riesgo {resultado.nivel}</span>
+          <p className="text-xs font-medium">Última evaluación: {formatearFechaEvaluacion(resultado.fechaCalculo)}</p>
         </div>
-        {usedFallbackFormula && <p className="w-full text-xs">Evaluación calculada con la fórmula predeterminada.</p>}
+        <p className="w-full text-sm">{resultado.mensaje}</p>
       </section>
 
       <div className="flex gap-4 items-start flex-col sm:flex-row w-full">
@@ -1484,7 +1502,7 @@ function mensajeErrorSolicitante(error: unknown) {
 
 function mensajeErrorFinanciero(error: unknown) {
   if (error instanceof ApiError) {
-    if (error.status === 400) return "Los datos financieros no son válidos."
+    if (error.status === 400) return error.detail
     if (error.status === 404) return "No se encontró el solicitante registrado."
     if (error.status === 409) return "El perfil financiero ya existe."
     if (error.status === 500) return "El backend reportó un error interno."
@@ -1508,10 +1526,10 @@ export default function RegistroWizard({
   const [toast, setToast] = useState<EstadoNotificacion>(null)
   const [isSavingSolicitante, setIsSavingSolicitante] = useState(false)
   const [isSavingFinanciero, setIsSavingFinanciero] = useState(false)
-  const [solicitanteRegistrado, setSolicitanteRegistrado] = useState<{
-    tipoDocumento: TipoDocumentoApi
-    numeroDocumento: string
-  } | null>(null)
+  const [solicitanteRegistrado, setSolicitanteRegistrado] =
+    useState<SolicitanteResponse | null>(null)
+  const [perfilFinancieroGuardado, setPerfilFinancieroGuardado] = useState(false)
+  const [calculationError, setCalculationError] = useState<ApiError | null>(null)
   const [finData, setFinData] = useState<EvaluacionScore | null>(null)
   const [financialFormKey, setFinancialFormKey] = useState(0)
 
@@ -1524,28 +1542,16 @@ export default function RegistroWizard({
   const handleRegSuccess = async (data: SolicitantePayload) => {
     setIsSavingSolicitante(true)
     try {
-      if (authMode === "mock") {
-        await new Promise((resolve) => setTimeout(resolve, 350))
-      } else {
-        if (!token) throw new Error("Debe iniciar sesión para continuar.")
-        await guardarSolicitante(data, token)
+      if (authMode !== "api" || !token) {
+        throw new Error("Debe iniciar sesión con el backend para continuar.")
       }
-      setSolicitanteRegistrado({
-        tipoDocumento: data.tipoDocumento,
-        numeroDocumento: data.numeroDocumento,
-      })
+      const solicitante = await guardarSolicitante(data, token)
+      setSolicitanteRegistrado(solicitante)
       setToast({
         type: "success",
-        title:
-          authMode === "mock"
-            ? "Solicitante registrado en modo simulación"
-            : "Solicitante registrado con éxito. ID generado",
-        sub:
-          authMode === "mock"
-            ? "Los datos permanecen en esta sesión local."
-            : `REF: CRD-${new Date().getFullYear()}-${String(Math.floor(10000 + Math.random() * 90000))}`,
+        title: "Solicitante registrado con éxito",
+        sub: `ID: ${solicitante.id}`,
       })
-      await new Promise<void>((resolve) => setTimeout(resolve, 1000))
       setStep(1)
     } catch (error) {
       setToast({
@@ -1553,6 +1559,7 @@ export default function RegistroWizard({
         title: "No fue posible registrar el solicitante",
         sub: mensajeErrorSolicitante(error),
       })
+      throw error
     } finally {
       setIsSavingSolicitante(false)
     }
@@ -1562,25 +1569,15 @@ export default function RegistroWizard({
     ing: number,
     eg: number,
     variableValues: Record<string, string>,
-    scoring: ScoringConfiguration,
+    variables: VariableRiesgo[],
   ) => {
     setIsSavingFinanciero(true)
     try {
       if (!solicitanteRegistrado) {
         throw new Error("No hay un solicitante registrado.")
       }
-
-      if (!Number.isFinite(ing) || !Number.isFinite(eg) || ing < 0 || eg < 0) {
-        throw new Error("Los valores financieros no son válidos.")
-      }
-
-      const score = calculateWeightedScore(variableValues, scoring.variables)
-      if (score === null) {
-        throw new Error("Completa los valores requeridos por la fórmula antes de calcular.")
-      }
-      const risk = classifyRisk(score, scoring.ranges)
-      if (!risk) {
-        throw new Error("El puntaje calculado no está cubierto por los rangos de riesgo configurados.")
+      if (authMode !== "api" || !token) {
+        throw new Error("Debe iniciar sesión con el backend para continuar.")
       }
 
       const payload: PerfilFinancieroPayload = {
@@ -1588,40 +1585,43 @@ export default function RegistroWizard({
         ingresos: ing,
         egresos: eg,
       }
-      if (authMode === "mock") {
-        await new Promise((resolve) => setTimeout(resolve, 350))
-      } else if (!finData) {
-        if (!token) throw new Error("Debe iniciar sesión para continuar.")
+      if (!perfilFinancieroGuardado) {
         await guardarDatosFinancieros(payload, token)
+        setPerfilFinancieroGuardado(true)
       }
-      setFinData({
-        ing,
-        eg,
-        score,
-        risk,
-        evaluatedAt: new Date().toISOString(),
-        usedFallbackFormula: scoring.usingFallbackFormula,
-        usedFallbackRanges: scoring.usingFallbackRanges,
+      const valores: ValorVariableRequest[] = variables.map((variable) => {
+        const rawValue = variableValues[String(variable.id)]?.trim() ?? ""
+        return {
+          variableId: variable.id,
+          valor: rawValue === "" ? null : Number(rawValue),
+        }
       })
+      const resultado = await calcularRiesgoSolicitante(
+        solicitanteRegistrado.id,
+        { valores },
+        token,
+      )
+      setCalculationError(null)
+      setFinData({ ing, eg, resultado })
       setToast({
         type: "success",
-        title:
-          authMode === "mock"
-            ? "Evaluación simulada correctamente"
-            : finData
-              ? "Riesgo crediticio recalculado"
-              : "Datos financieros guardados y riesgo calculado",
-        sub:
-          authMode === "mock"
-            ? `Puntaje: ${score} pts · Riesgo ${risk}. No se llamó al backend.`
-            : `Puntaje: ${score} pts · Riesgo ${risk}.`,
+        title: "Riesgo calculado por el backend",
+        sub: resultado.mensaje,
       })
-      await new Promise<void>((resolve) => setTimeout(resolve, 1000))
       setStep(2)
     } catch (error) {
+      if (
+        error instanceof ApiError &&
+        error.status === 400 &&
+        error.codigo === "DATOS_INCOMPLETOS"
+      ) {
+        setCalculationError(error)
+        return
+      }
+      setCalculationError(null)
       setToast({
         type: "error",
-        title: "No fue posible guardar los datos financieros",
+        title: "No fue posible calcular el riesgo",
         sub: mensajeErrorFinanciero(error),
       })
     } finally {
@@ -1632,6 +1632,8 @@ export default function RegistroWizard({
   const handleReset = () => {
     setStep(0)
     setSolicitanteRegistrado(null)
+    setPerfilFinancieroGuardado(false)
+    setCalculationError(null)
     setFinData(null)
     setFinancialFormKey((current) => current + 1)
     setIsSavingSolicitante(false)
@@ -1646,6 +1648,7 @@ export default function RegistroWizard({
         <PasoRegistro
           onSuccess={handleRegSuccess}
           isSavingSolicitante={isSavingSolicitante}
+          token={token}
         />
       )}
       <PasoFinanciero
@@ -1654,15 +1657,15 @@ export default function RegistroWizard({
         onSuccess={handleFinSuccess}
         onBack={() => setStep(0)}
         isSavingFinanciero={isSavingFinanciero}
+        calculationError={calculationError}
+        onClearCalculationError={() => setCalculationError(null)}
+        token={token}
       />
       {step === 2 && finData && (
         <ResumenFinanciero
           ingresos={finData.ing}
           egresos={finData.eg}
-          score={finData.score}
-          risk={finData.risk}
-          evaluatedAt={finData.evaluatedAt}
-          usedFallbackFormula={finData.usedFallbackFormula}
+          resultado={finData.resultado}
           onBack={() => setStep(1)}
           onReset={handleReset}
         />
