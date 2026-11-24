@@ -10,21 +10,21 @@ import {
 
 const NIVELES = [
   {
-    nivel: "BAJO",
+    nivel: "Bajo",
     label: "Riesgo bajo",
     icon: "↓",
     className: "border-emerald-200 bg-emerald-50 text-emerald-800",
     barClassName: "bg-emerald-600",
   },
   {
-    nivel: "MEDIO",
+    nivel: "Medio",
     label: "Riesgo medio",
     icon: "↔",
     className: "border-amber-200 bg-amber-50 text-amber-800",
     barClassName: "bg-amber-500",
   },
   {
-    nivel: "ALTO",
+    nivel: "Alto",
     label: "Riesgo alto",
     icon: "↑",
     className: "border-red-200 bg-red-50 text-red-800",
@@ -33,14 +33,14 @@ const NIVELES = [
 ] as const
 
 function normalizeLevel(level: string) {
-  return level.trim().toLocaleUpperCase()
+  return level.trim().toLocaleLowerCase()
 }
 
 function findLevel(
   distribution: DistribucionRiesgoItem[],
   level: string,
 ) {
-  return distribution.find((item) => normalizeLevel(item.nivel) === level)
+  return distribution.find((item) => normalizeLevel(item.nivel) === normalizeLevel(level))
 }
 
 function percentageLabel(value: number) {
@@ -125,7 +125,7 @@ export default function DashboardCartera() {
   }
 
   const exportReport = async () => {
-    if (!token || !distribution || distribution.totalEvaluados === 0) return
+    if (!token || !distribution) return
     setExporting(true)
     setExportError("")
     try {
@@ -141,10 +141,10 @@ export default function DashboardCartera() {
     }
   }
 
-  const totalEvaluados = distribution?.totalEvaluados ?? 0
+  const totalSolicitantes = distribution?.totalSolicitantes ?? 0
   const riskPercent = (level: string) =>
     findLevel(distribution?.distribucion ?? [], level)?.porcentaje ?? 0
-  const exportDisabled = loading || exporting || totalEvaluados === 0
+  const exportDisabled = loading || exporting
 
   return (
     <section className="space-y-7" aria-labelledby="portfolio-title">
@@ -168,11 +168,6 @@ export default function DashboardCartera() {
             <span aria-hidden="true">⇩</span>
             {exporting ? "Preparando reporte..." : "Exportar Reporte"}
           </button>
-          {!loading && totalEvaluados === 0 && (
-            <p className="text-xs text-slate-500" role="status">
-              No hay evaluaciones para exportar con estos filtros.
-            </p>
-          )}
         </div>
       </header>
 
@@ -253,11 +248,11 @@ export default function DashboardCartera() {
           <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
             <article className="border border-slate-200 bg-white p-5">
               <div className="flex items-center justify-between gap-3">
-                <p className="text-sm font-medium text-slate-600">Total evaluados</p>
+                <p className="text-sm font-medium text-slate-600">Total solicitantes</p>
                 <span aria-hidden="true" className="text-lg font-bold text-blue-700">Σ</span>
               </div>
               <p className="mt-4 text-3xl font-bold tabular-nums text-slate-950">
-                {formatCount(totalEvaluados)}
+                {formatCount(totalSolicitantes)}
               </p>
             </article>
             {NIVELES.map((level) => (
@@ -289,13 +284,13 @@ export default function DashboardCartera() {
                 </p>
               </div>
               <p className="text-sm font-semibold tabular-nums text-slate-700">
-                {formatCount(totalEvaluados)} evaluaciones
+                {formatCount(totalSolicitantes)} solicitantes
               </p>
             </div>
 
-            {totalEvaluados === 0 ? (
+            {totalSolicitantes === 0 ? (
               <p className="mt-6 border border-slate-200 bg-white px-5 py-8 text-center text-sm text-slate-600">
-                No hay evaluaciones dentro del periodo seleccionado.
+                {distribution.mensaje}
               </p>
             ) : (
               <div className="mt-6 max-w-3xl space-y-5" role="img" aria-label="Barras porcentuales de evaluaciones por nivel de riesgo">
@@ -315,7 +310,7 @@ export default function DashboardCartera() {
                           <span className="font-semibold text-slate-900">{level.label}</span>
                         </div>
                         <span className="tabular-nums text-slate-700">
-                          {formatCount(item?.cantidad ?? 0)} · {percentageLabel(item?.porcentaje ?? 0)}
+                          {formatCount(item?.total ?? 0)} · {percentageLabel(item?.porcentaje ?? 0)}
                         </span>
                       </div>
                       <div className="h-3 w-full bg-slate-100" aria-hidden="true">
