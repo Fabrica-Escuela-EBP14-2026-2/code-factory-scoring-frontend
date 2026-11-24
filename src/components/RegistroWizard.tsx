@@ -1503,7 +1503,7 @@ function mensajeErrorSolicitante(error: unknown) {
 function mensajeErrorFinanciero(error: unknown) {
   if (error instanceof ApiError) {
     if (error.status === 400) return error.detail
-    if (error.status === 404) return "No se encontró el solicitante registrado."
+    if (error.status === 404) return error.detail || "No se encontró un recurso necesario para el cálculo."
     if (error.status === 409) return "El perfil financiero ya existe."
     if (error.status === 500) return "El backend reportó un error interno."
   }
